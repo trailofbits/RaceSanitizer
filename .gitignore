@@ -1,0 +1,6 @@
+third_party/*
+*.o
+*.out
+bin/*
+build/*
+
