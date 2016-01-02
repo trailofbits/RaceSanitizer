@@ -127,17 +127,21 @@ struct AllocationList {
 
 typedef Allocation SamplePointList[kMaxNumSamplePoints];
 
-// Maps allocation site hash to a stack trace.
-static std::vector<TypeId> gTypeIds;
-static std::set<TypeId> gIgnoreSet;
-static std::unordered_map<TypeId, StackTrace> gAllocationSites;
-static std::unordered_map<TypeId, AllocationList> gRecentAllocations;
-static std::mutex gAllocationLock;
+struct DynamicState {
+  // Maps allocation site hash to a stack trace.
+  std::vector<TypeId> type_ids;
+  std::set<TypeId> ignored_type_ids;
+  std::unordered_map<TypeId, StackTrace> allocation_sites;
+  std::unordered_map<TypeId, AllocationList> recent_allocations;
+  std::mutex allocation_lock;
+};
+
+static DynamicState *gDyn = nullptr;
 
 // The current stuff being sampled.
 static AllocationList gSamplePoints;
 static StackTrace gAllocStackTrace;
-static size_t gTypeIdIndex = 0;  // Index into `gTypeIds`.
+static size_t gTypeIdIndex = 0;  // Index into `type_ids`.
 static TypeId gTypeId = 0;
 
 // Global pointer to the shadow memory containing the watchpoints.
@@ -230,15 +234,15 @@ static void ActivateWatchpoints(uintptr_t addr, uintptr_t size) {
 // Activate watchpoints for all sample points.
 static bool ActivateWatchpoints(void) {
   gTypeId = 0;
-  gAllocationLock.lock();
-  if (!gTypeIds.empty()) {
-    gTypeId = gTypeIds[gTypeIdIndex++ % gTypeIds.size()];
-    gSamplePoints = gRecentAllocations[gTypeId];
-    gAllocStackTrace = gAllocationSites[gTypeId];
+  gDyn->allocation_lock.lock();
+  if (!gDyn->type_ids.empty()) {
+    gTypeId = gDyn->type_ids[gTypeIdIndex++ % gDyn->type_ids.size()];
+    gSamplePoints = gDyn->recent_allocations[gTypeId];
+    gAllocStackTrace = gDyn->allocation_sites[gTypeId];
   }
-  gAllocationLock.unlock();
+  gDyn->allocation_lock.unlock();
 
-  if (!gTypeId || gIgnoreSet.count(gTypeId)) {
+  if (!gTypeId || gDyn->ignored_type_ids.count(gTypeId)) {
     return false;
   }
 
@@ -379,7 +383,7 @@ static void MonitorThread(void) {
 
     if (ReportDataRaces()) {
       debug_write(2, "!", 1);
-      gIgnoreSet.insert(gTypeId);
+      gDyn->ignored_type_ids.insert(gTypeId);
     }
 
     usleep(kPauseTimeUs);
@@ -398,6 +402,8 @@ class RaceSanitizer {
     sprintf(gBuf, "%s.%d", log_file ? log_file : "/tmp/rsan", getpid());
     gLogFd = open(gBuf, O_WRONLY | O_APPEND | O_CREAT, 0666);
     if (errno) return;
+
+    gDyn = new DynamicState;
 
     std::thread monitor(MonitorThread);
     monitor.detach();
@@ -526,17 +532,17 @@ void __rsan_record_alloc(uintptr_t addr, size_t size) {
     return;
   }
 
-  gAllocationLock.lock();
-  auto &saved_trace = gAllocationSites[type_id];
+  gDyn->allocation_lock.lock();
+  auto &saved_trace = gDyn->allocation_sites[type_id];
   if (!saved_trace.pc[0]) {
     saved_trace = trace;
-    gTypeIds.push_back(type_id);
+    gDyn->type_ids.push_back(type_id);
     debug_write(2, "T", 1);
   }
 
-  auto &allocs = gRecentAllocations[type_id];
+  auto &allocs = gDyn->recent_allocations[type_id];
   allocs.Add(addr, size);
-  gAllocationLock.unlock();
+  gDyn->allocation_lock.unlock();
 }
 
 // Replacement for `posix_memalign`, which needs some special handling.
